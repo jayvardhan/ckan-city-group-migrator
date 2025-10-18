@@ -1,0 +1,5 @@
+{
+    "SOURCE_CKAN_URL": "https://source-ckan-domain.com/api/3/action",
+    "TARGET_CKAN_URL": "https://target-ckan-domain.com",
+    "TARGET_API_KEY": ""
+}
