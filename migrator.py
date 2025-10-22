@@ -11,21 +11,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 # ----------------------------
-# Logging setup
-# ----------------------------
-logging.basicConfig(
-    filename="city_group_migration.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger()
-
-
-# ----------------------------
 # Load Configuration file
 # ----------------------------
 
-def load_config(config_file):
+def load_config(config_file, logger):
     """Load configuration from a JSON file"""
     try:
         with open(config_file, 'r') as f:
@@ -45,7 +34,7 @@ def load_config(config_file):
 
 
 # Returns datsets names for given city
-def get_datasets_by_city(city, config):
+def get_datasets_by_city(city, config, logger):
     
     SOURCE_CKAN_URL = config.get("SOURCE_CKAN_URL")
 
@@ -54,7 +43,7 @@ def get_datasets_by_city(city, config):
             "q": f'?city="{city}"',
             "rows": 1000
         }
-        r = requests.get(f"{SOURCE_CKAN_URL}/package_search", params=params, timeout=20)
+        r = requests.get(f"{SOURCE_CKAN_URL}/api/3/action/package_search", params=params, timeout=20)
         r.raise_for_status()
         data = r.json()
 
@@ -72,7 +61,7 @@ def get_datasets_by_city(city, config):
 
 
 # Creates a city-dataset JSON file
-def create_dataset_by_city(config):
+def create_dataset_by_city(config, logger):
     #city list csv file path
     city_list_file = "city_list.csv"
 
@@ -96,7 +85,7 @@ def create_dataset_by_city(config):
 
         logger.info(f"Processing city: {city} ({label})")
 
-        dataset = get_datasets_by_city(city, config)
+        dataset = get_datasets_by_city(city, config, logger)
         city_dataset_map[city] = dataset
     
     # Save city-dataset mapping to JSON file
@@ -111,7 +100,7 @@ def create_dataset_by_city(config):
 
 
 # Creates Group and attaches its datasets on target CKAN site
-def create_group_with_dataset(config):
+def create_group_with_dataset(config, logger):
     
     # city dataset json file path
     json_path = 'datasets_by_city.json'
@@ -184,13 +173,113 @@ def create_group_with_dataset(config):
 
 
 
-if __name__ == "__main__":
-        
-    # configuration file path
-    config_file = "config.json"
 
-    # Load configuration from file
-    config = load_config(config_file)
+def export_groups_to_json(config, output_file, logger):
+    source_ckan_url = config.get("SOURCE_CKAN_URL")
+    
+    # Ensure proper base URL
+    base_api_url = source_ckan_url.rstrip('/') + '/api/3/action/'
+
+    headers = {
+        'Content-Type': 'application/json'
+    }
+
+    results = []
+
+    logger.info(f"*****Starting source group dataset fetch**********")
+
+    try:
+        # Get group list
+        group_list_url = base_api_url + 'group_list'
+        params = {
+            "all_fields": True
+        }
+        resp = requests.get(group_list_url, headers=headers, params=params, timeout=20)
+        resp.raise_for_status()
+        group_list = resp.json()
+        if not group_list.get('success'):
+            logger.error(f"Failed to get group list: {group_list}")
+            return []
+
+        groups = group_list['result']
+        
+        # print(json.dumps(groups, indent=2, ensure_ascii=False))
+        logger.info(f"Found {len(groups)} groups on source CKAN.")
+
+        # Get each group's datasets
+        for group in groups:
+            group_show_url = base_api_url + 'group_show'
+            group_name = group.get('name')
+            try:
+                params = {
+                    'id': group_name,
+                    'include_dataset_count':True,
+                    'include_datasets':True,
+                    'include_extras':False,
+                    'include_users':False,
+                    'include_groups':False,
+                    'include_tags':False,
+                    'include_followers':False
+                }
+                r = requests.get(group_show_url, headers=headers, params=params, timeout=15)
+                r.raise_for_status()
+                data = r.json()
+                
+                if not data.get('success'):
+                    logger.warning(f"Skipping group '{group_name}' due to API error: {data}")
+                    continue
+
+                group_info = data['result']
+                
+                datasets = [pkg['name'] for pkg in group_info.get('packages', [])]
+                results.append({
+                    "group_name": group_name,
+                    "datasets": datasets
+                })
+                logger.info(f"Fetched {len(datasets)} datasets for group '{group_name}'")
+
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Network error fetching group '{group_name}': {e}")
+            except (KeyError, ValueError) as e:
+                logger.error(f"Malformed response for group '{group_name}': {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error fetching '{group_name}': {e}")
+
+        # Write to JSON file
+        try:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+            logger.info(f"Export completed successfully. File saved to '{output_file}'.")
+        except Exception as e:
+            logger.error(f"Failed to write JSON file '{output_file}': {e}")
+
+        return results
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to connect to CKAN at '{source_ckan_url}': {e}")
+    except Exception as e:
+        logger.error(f"Unexpected top-level error: {e}")
+
+    return []
+
+
+
+
+if __name__ == "__main__":
+
+
+    # Logging setup
+    logging.basicConfig(
+        filename="migration.log",
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+    logger = logging.getLogger()
+
+        
+    # Configuration setup
+    config_file = "config.json"
+    config = load_config(config_file, logger)
     
     if not config:
         logger.error(f"Could not load configuration from {config_file}")
@@ -198,11 +287,15 @@ if __name__ == "__main__":
 
     logger.info("Loaded Configuration file")
 
+
     # generate city dataset json file
-    create_dataset_by_city(config)
+    # create_dataset_by_city(config, logger)
 
     # create group and attach dataset on target site
-    create_group_with_dataset(config)
+    # create_group_with_dataset(config, logger)
+
+    # generate goup datasets json file
+    export_groups_to_json(config, "group_dataset.json", logger)
 
 
 
