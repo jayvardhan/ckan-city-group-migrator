@@ -37,13 +37,16 @@ def load_config(config_file, logger):
 def get_datasets_by_city(city, config, logger):
     
     SOURCE_CKAN_URL = config.get("SOURCE_CKAN_URL")
+    SOURCE_API_KEY = config.get("SOURCE_API_KEY")
 
     try:
         params = {
-            "q": f'?city="{city}"',
+            "q": f'city:"{city}"',
             "rows": 1000
         }
-        r = requests.get(f"{SOURCE_CKAN_URL}/api/3/action/package_search", params=params, timeout=20)
+        headers = {"Authorization": SOURCE_API_KEY}
+        r = requests.get(f"{SOURCE_CKAN_URL}/api/3/action/package_search", headers=headers, params=params)
+        
         r.raise_for_status()
         data = r.json()
 
@@ -289,16 +292,12 @@ if __name__ == "__main__":
 
 
     # generate city dataset json file
-    # create_dataset_by_city(config, logger)
-
+    #create_dataset_by_city(config, logger)
+    
     # create group and attach dataset on target site
-    # create_group_with_dataset(config, logger)
+    create_group_with_dataset(config, logger)
 
     # generate goup datasets json file
-    export_groups_to_json(config, "group_dataset.json", logger)
+    #export_groups_to_json(config, "group_dataset.json", logger)
 
 
-
-    
-
-    
