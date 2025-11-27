@@ -5,6 +5,7 @@ import csv
 import requests
 import ckanapi
 import urllib3
+from collections import defaultdict
 
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -101,6 +102,86 @@ def create_dataset_by_city(config, logger):
         logging.error(f"Error writing JSON file: {e}")
 
 
+# Delete existing tags from the site
+def delete_tags(config, logger):
+    json_path = 'source_tag_list.json'
+
+    # Load CKAN config (URL + API token)
+    ckan_url = config.get("STAGING_CKAN_URL")
+    api_token = config.get("STAGING_API_KEY")
+
+    if not (ckan_url and api_token):
+        print("Missing TARGET_CKAN_URL or TARGET_API_KEY in config.")
+        sys.exit(1)
+
+    # Create a session that skips SSL verification
+    session = requests.Session()
+    session.verify = False
+
+    # Connect to CKAN
+    ckan = ckanapi.RemoteCKAN(ckan_url, apikey=api_token, session=session)
+
+    logger.info(f"******* Starting Tag Deletion on {ckan_url}*********")
+
+    # Load city → datasets mapping
+    with open(json_path) as f:
+        tags = json.load(f)
+    
+    for tag in tags['result']:
+        try:
+            ckan.action.tag_delete(id=tag)
+            logger.info(f"Deleted tag {tag}")
+        except Exception as e:
+            logger.error(f"Exception occured while deleting tag {tag} : {e}")
+
+
+
+# attach tags(previously theme) to its dataset
+def patch_dataset_with_tag(config, logger):
+    # dataset-tag json file path
+    json_path = 'dataset_tag.json'
+
+    # Load CKAN config (URL + API token)
+    ckan_url = config.get("TARGET_CKAN_URL")
+    api_token = config.get("TARGET_API_KEY")
+
+    if not (ckan_url and api_token):
+        print("Missing TARGET_CKAN_URL or TARGET_API_KEY in config.")
+        sys.exit(1)
+
+    # Create a session that skips SSL verification
+    session = requests.Session()
+    session.verify = False
+
+    # Connect to CKAN
+    ckan = ckanapi.RemoteCKAN(ckan_url, apikey=api_token, session=session)
+
+    logger.info(f"******* Patching Dataset with tag on {ckan_url} *********")
+
+    # Load city → datasets mapping
+    with open(json_path) as f:
+        data = json.load(f)
+
+    for dataset_id, tags_list in data.items():
+        # Format the tags list into the required CKAN API format: [{'name': 'Tag1'}, ...]
+        api_tags_format = [{'name': tag_name} for tag_name in tags_list]
+    
+        data_dict = {
+            'id': dataset_id,
+            'tags': api_tags_format
+        }
+        
+        try:
+            logger.info(f"Patching dataset '{dataset_id}' with tags: {tags_list}")
+            ckan.call_action('package_patch', data_dict)
+            logger.info(f"Successfully patched '{dataset_id}'.")
+            
+        except ckanapi.errors.CKANAPIError as e:
+            logger.error(f"Error patching dataset: '{dataset_id}': {e}")
+    
+    logger.info("Completed Patching Dataset with Tags!")
+
+
 
 # Creates Group and attaches its datasets on target CKAN site
 def create_group_with_dataset(config, logger):
@@ -174,96 +255,119 @@ def create_group_with_dataset(config, logger):
     logger.info("Completed Group and Dataset Creation!")
 
 
-
-
-
+# export group(theme) and its associated dataset to json file
 def export_groups_to_json(config, output_file, logger):
     source_ckan_url = config.get("SOURCE_CKAN_URL")
-    
-    # Ensure proper base URL
-    base_api_url = source_ckan_url.rstrip('/') + '/api/3/action/'
-
-    headers = {
-        'Content-Type': 'application/json'
-    }
+    source_ckan_api = config.get("SOURCE_CKAN_API")
 
     results = []
 
-    logger.info(f"*****Starting source group dataset fetch**********")
+    logger.info("*****Starting source group dataset fetch using ckanapi**********")
+
+    # Create a session that skips SSL verification
+    session = requests.Session()
+    session.verify = False
 
     try:
-        # Get group list
-        group_list_url = base_api_url + 'group_list'
-        params = {
-            "all_fields": True
-        }
-        resp = requests.get(group_list_url, headers=headers, params=params, timeout=20)
-        resp.raise_for_status()
-        group_list = resp.json()
-        if not group_list.get('success'):
-            logger.error(f"Failed to get group list: {group_list}")
+        # Create CKAN API client
+        ckan = ckanapi.RemoteCKAN(
+            address=source_ckan_url,
+            apikey=source_ckan_api,
+            session=session
+        )
+
+        # 1. Fetch all groups
+        try:
+            groups = ckan.call_action('group_list', {"all_fields": True})
+            logger.info(f"Found {len(groups)} groups on source CKAN.")
+        except ckanapi.CKANAPIError as e:
+            logger.error(f"Failed to get group list: {str(e)}")
             return []
 
-        groups = group_list['result']
-        
-        # print(json.dumps(groups, indent=2, ensure_ascii=False))
-        logger.info(f"Found {len(groups)} groups on source CKAN.")
-
-        # Get each group's datasets
+        # 2. Iterate over groups
         for group in groups:
-            group_show_url = base_api_url + 'group_show'
             group_name = group.get('name')
+
+            logger.info(f"Fetching dataset list for group '{group_name}'")
+
             try:
                 params = {
                     'id': group_name,
-                    'include_dataset_count':True,
-                    'include_datasets':True,
-                    'include_extras':False,
-                    'include_users':False,
-                    'include_groups':False,
-                    'include_tags':False,
-                    'include_followers':False
+                    'include_dataset_count': True,
+                    'include_datasets': True,
+                    'include_extras': False,
+                    'include_users': False,
+                    'include_groups': False,
+                    'include_tags': False,
+                    'include_followers': False
                 }
-                r = requests.get(group_show_url, headers=headers, params=params, timeout=15)
-                r.raise_for_status()
-                data = r.json()
-                
-                if not data.get('success'):
-                    logger.warning(f"Skipping group '{group_name}' due to API error: {data}")
-                    continue
 
-                group_info = data['result']
-                
+                group_info = ckan.call_action('group_show', params)
+
                 datasets = [pkg['name'] for pkg in group_info.get('packages', [])]
+
                 results.append({
                     "group_name": group_name,
                     "datasets": datasets
                 })
+
                 logger.info(f"Fetched {len(datasets)} datasets for group '{group_name}'")
 
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Network error fetching group '{group_name}': {e}")
-            except (KeyError, ValueError) as e:
-                logger.error(f"Malformed response for group '{group_name}': {e}")
+            except ckanapi.NotFound:
+                logger.warning(f"Group '{group_name}' not found, skipping.")
+            except ckanapi.CKANAPIError as e:
+                logger.error(f"API error fetching group '{group_name}': {e}")
             except Exception as e:
                 logger.error(f"Unexpected error fetching '{group_name}': {e}")
 
-        # Write to JSON file
+        # 3. Save JSON
         try:
             with open(output_file, 'w', encoding='utf-8') as f:
                 json.dump(results, f, indent=2, ensure_ascii=False)
+
             logger.info(f"Export completed successfully. File saved to '{output_file}'.")
         except Exception as e:
             logger.error(f"Failed to write JSON file '{output_file}': {e}")
 
         return results
 
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to connect to CKAN at '{source_ckan_url}': {e}")
     except Exception as e:
-        logger.error(f"Unexpected top-level error: {e}")
+        logger.error(f"Unexpected top-level error connecting to CKAN: {e}")
 
     return []
+
+
+
+# helper function to create dataset-tag-mapping from group-dataset data
+def prepare_dataset_tag_mapping(logger):
+    json_input_path = 'group_dataset.json'
+    json_output_path = 'dataset_tag.json'
+
+    logger.info("******* Starting Dataset Tag mapping file *********")
+
+    # Load city → datasets mapping
+    with open(json_input_path) as f:
+        input_data = json.load(f)
+
+    # Use defaultdict to automatically create an empty list for a new dataset ID
+    dataset_tags_map = defaultdict(list)
+
+    for entry in input_data:
+        tag = entry['tag_name']
+        for dataset_id in entry['datasets']:
+            # Append the tag to the dataset's list of tags
+            dataset_tags_map[dataset_id].append(tag)
+
+    # Convert defaultdict back to a regular dict for final output
+    output_structure = dict(dataset_tags_map)
+
+    try:
+        with open(json_output_path, "w", encoding="utf-8") as f:
+            json.dump(output_structure, f, indent=2, ensure_ascii=False)
+            logging.info(f"Saved dataset-tag mapping to {json_output_path}")
+    except Exception as e:
+        logging.error(f"Error writing JSON file: {e}")
+
 
 
 
@@ -292,12 +396,21 @@ if __name__ == "__main__":
 
 
     # generate city dataset json file
-    #create_dataset_by_city(config, logger)
+    # create_dataset_by_city(config, logger)
     
     # create group and attach dataset on target site
-    create_group_with_dataset(config, logger)
+    # create_group_with_dataset(config, logger)
 
     # generate goup datasets json file
-    #export_groups_to_json(config, "group_dataset.json", logger)
+    # export_groups_to_json(config, "group_dataset.json", logger)
+    
+    # delete existing tags from the target site
+    # delete_tags(config, logger)
+
+    # prepare datset tag file
+    # prepare_dataset_tag_mapping(logger)
+
+    # patch dataset to attach tags(theme)
+    # patch_dataset_with_tag(config, logger)
 
 
